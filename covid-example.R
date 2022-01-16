@@ -15,6 +15,10 @@ admits <- hospitalizations[,.(admits = sum(at_admission_confirmed_covid19_patien
                               ed_visits = sum(ed_covid_visits_previous_day),
                               icu = sum(full_adult_icu_covid19_positive_patients)), by = "date"]
 
+variant_information <- fread(hh("data-raw", "variant.csv"))[,list(DateDT,Variant,Perc)]
+
+variant_information[,DateDT:=DateDT-30]
+
 admits <- admits[order(date)][!is.na(ed_visits)]
 
 mobility <- rbindlist(lapply(list.files(pattern = ".csv"), fread))
@@ -29,15 +33,24 @@ combined_dat <- combined_at[!is.na(admits)][!is.na(deaths_by_date)]
 
 combined_dat <- merge(combined_dat,nc_mobility, by = "date", all.x = TRUE)
 
-# Add Variant Swags
-combined_dat[,Variant:=fcase(date < "2021-03-15","Original",
-             date < "2021-07-25","Alpha",
-             date < "2021-12-15","Delta",
-             default = "Omicron")]
+library(tidyr)
+combined_dat_full <- combined_dat %>%
+  gather(metric, value, -date, -retail) %>%
+  left_join(variant_information, by = c("date" = "DateDT")) %>%
+  filter(!is.na(Variant)) %>%
+  mutate(value =  round(value * Perc)) %>%
+  select(date,retail, metric, value, Variant) %>%
+  spread(metric, value, fill = 0)
 
-combined_dat[,Variant:=factor(Variant, c("Original", "Alpha", "Delta", "Omicron"))]
+# # Add Variant Swags
+# combined_dat[,Variant:=fcase(date < "2021-03-15","Original",
+#              date < "2021-07-25","Alpha",
+#              date < "2021-12-15","Delta",
+#              default = "Omicron")]
+#
+# combined_dat[,Variant:=factor(Variant, c("Original", "Alpha", "Delta", "Omicron"))]
 
-p1 <- combined_dat %>%
+p1 <- combined_dat_full %>%
   ggplot(aes(date,admits, color = Variant))+
   geom_line()+
   labs(
@@ -46,7 +59,7 @@ p1 <- combined_dat %>%
     x = NULL
   )+
   theme_classic()
-p2 <- combined_dat %>%
+p2 <- combined_dat_full %>%
   ggplot(aes(date,cases, color = Variant))+
   geom_line()+
   labs(
@@ -56,7 +69,7 @@ p2 <- combined_dat %>%
   )+
   theme_classic()
 
-p3 <- combined_dat %>%
+p3 <- combined_dat_full %>%
   ggplot(aes(date,deaths_by_date, color = Variant))+
   geom_line()+
   labs(
@@ -66,17 +79,17 @@ p3 <- combined_dat %>%
   )+
   theme_classic()
 
-p4 <- combined_dat %>%
+p4 <- combined_dat_full %>%
   ggplot(aes(date,n_tests, color = Variant))+
   geom_line()+
   labs(
     title = "Trend of Tests",
-    y = "Cases",
+    y = "Tests",
     x = NULL
   )+
   theme_classic()
 
-p5 <- combined_dat %>%
+p5 <- combined_dat_full %>%
   ggplot(aes(date,retail, color = Variant))+
   geom_line()+
   labs(
@@ -88,49 +101,56 @@ p5 <- combined_dat %>%
 
 cowplot::plot_grid(p1, p2, p3, p4,
                    labels = c('A', 'B', 'C', 'D'), label_size = 12)
+unique(combined_dat_full$Variant)
+combined_dat_full$Variant <- factor(combined_dat_full$Variant,
+                                                            c("Alpha", "Beta",
+                                                              "Delta", "Delta-Plus",
+                                                              "Epsilon", "Gamma",
+                                                              "Mu", "Omicron"))
 
-
+combined_dat_full_use <- setDT(combined_dat_full)[!is.na(Variant)][Variant%in% c("Alpha","Delta", "Omicron")]
 # do the analysis like they do --------------------------------------------
-summary(combined_dat)
+summary(combined_dat_full_use)
 
 # SET THE DEFAULT ACTION FOR MISSING DATA TO na.exclude
 # (MISSING EXCLUDED IN ESTIMATION BUT RE-INSERTED IN PREDICTION/RESIDUALS)
 options(na.action="na.exclude")
 
 # SCALE EXPOSURE
-combined_dat$cases100 <- combined_dat$cases/100
-combined_dat$logtests <- log(combined_dat$n_tests)
+combined_dat_full_use$cases100 <- combined_dat_full_use$cases/100
+combined_dat_full_use$logtests <- log(combined_dat_full_use$n_tests)
 
 # GENERATE MONTH AND YEAR
-combined_dat$month  <- as.factor(months(combined_dat$date))
-combined_dat$year   <- as.factor(format(combined_dat$date, format="%Y") )
-combined_dat$dow    <- as.factor(weekdays(combined_dat$date))
-combined_dat$stratum <- as.factor(combined_dat$year:combined_dat$month:combined_dat$dow)
+combined_dat_full_use$month  <- as.factor(months(combined_dat_full_use$date))
+combined_dat_full_use$year   <- as.factor(format(combined_dat_full_use$date, format="%Y") )
+combined_dat_full_use$dow    <- as.factor(weekdays(combined_dat_full_use$date))
+combined_dat_full_use$stratum <- as.factor(combined_dat_full_use$year:combined_dat_full_use$month:combined_dat_full_use$dow)
 
-combined_dat <- combined_dat[order(combined_dat$date),]
-combined_dat$tst <- rnorm(nrow(combined_dat))
+combined_dat_full_use <- combined_dat_full_use[order(combined_dat_full_use$date),]
+combined_dat_full_use$tst <- rnorm(nrow(combined_dat_full_use))
 # FIT A CONDITIONAL POISSON MODEL WITH A YEAR X MONTH X DOW STRATA
 variant_cpr_death <- gnm(deaths_by_date ~ cases100 + Variant + retail,
-                         data=subset(combined_dat,date > Sys.Date()-180), family=quasipoisson(),
+                         data=subset(combined_dat_full_use,date > Sys.Date()-180), family=quasipoisson(),
                  eliminate=factor(stratum))
 variant_cpr_icu <- gnm(icu ~ cases100 + Variant+ retail,
-                       data=subset(combined_dat,date > Sys.Date()-180), family=quasipoisson(),
+                       data=subset(combined_dat_full_use,date > Sys.Date()-180), family=quasipoisson(),
                    eliminate=factor(stratum))
 variant_cpr_admit <- gnm(admits ~ cases100 + Variant+ retail ,
-                         data=subset(combined_dat,date > Sys.Date()-180), family=quasipoisson(),
+                         data=subset(combined_dat_full_use,date > Sys.Date()-180), family=quasipoisson(),
                        eliminate=factor(stratum))
 variant_cpr_ed <- gnm(ed_visits ~ cases100 + Variant+ retail,
-                      data=subset(combined_dat,date > Sys.Date()-180), family=quasipoisson(),
+                      data=subset(combined_dat_full_use,date > Sys.Date()-180), family=quasipoisson(),
                          eliminate=factor(stratum))
 
 fits <- list(variant_cpr_death,variant_cpr_admit,variant_cpr_ed,variant_cpr_icu)
 
 results_large <- lapply(fits, function(x){
 
-results <- cbind(as.data.table(coef(x)),
-                 as.data.table(confint(x)))
+results <- cbind(as.data.table(se(variant_cpr_admit))#,
+                 #as.data.table(confint(x))
+                 )
 
-names(results) <- c("estimate", "q025", "q975")
+names(results) <- c("estimate", "std_error")
 
 results$parameter <- names(coef(x))
 
@@ -141,6 +161,9 @@ results
 names(results_large) <- c("Death", "Admit", "ED", "ICU")
 
 results_large <- rbindlist(results_large, idcol = "outcome")
+
+results_large[,q025:=estimate-2*std_error]
+results_large[,q975:=estimate+2*std_error]
 
 results_large %>%
 ggplot(aes(parameter))+
